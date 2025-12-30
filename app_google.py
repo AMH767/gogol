@@ -24,7 +24,7 @@ app = Flask(__name__)
 # Глобальное хранилище задач
 tasks = {}
 
-# Настройка базы данных PostgreSQL
+# Настройка базы данных PostgreSQL (Supabase)
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
 def get_db_connection():
@@ -32,12 +32,12 @@ def get_db_connection():
         return None
     
     url = DATABASE_URL
-    # Удаляем pgbouncer=true, если он есть, так как psycopg2 может его не понимать
+    # Очистка строки подключения от pgbouncer, если он есть
     if 'pgbouncer=true' in url:
         url = url.replace('pgbouncer=true', '')
         url = url.replace('?&', '?').replace('&&', '&').strip('?&')
     
-    # Добавляем sslmode=require для безопасности и стабильности, если его нет
+    # Принудительный SSL для Supabase
     if 'sslmode' not in url:
         if '?' in url:
             url += '&sslmode=require'
@@ -111,10 +111,10 @@ def log_message(task_id, msg):
 class GoogleMapsParser:
     def __init__(self, task_id, query, many, lang='ru', region='RU', deep_search=True):
         self.task_id = task_id
-        self.query = query if query else ""
-        self.many = int(many) if many else 10
-        self.lang = lang if lang else 'ru'
-        self.region = region if region else 'RU'
+        self.query = query
+        self.many = many
+        self.lang = lang
+        self.region = region
         self.deep_search = deep_search
         self.max_workers = 5
         self.results_lock = threading.Lock()
@@ -154,9 +154,7 @@ class GoogleMapsParser:
             return None
 
     def get_links_for_query(self, search_query, limit):
-        if not search_query:
-            return []
-            
+        if not search_query: return []
         driver = self.create_driver()
         if not driver: return []
         
@@ -184,8 +182,7 @@ class GoogleMapsParser:
             if not scrollable_div: 
                 try:
                     scrollable_div = driver.find_element(By.TAG_NAME, "body")
-                except:
-                    pass
+                except: pass
 
             last_len = 0
             no_change = 0
@@ -320,8 +317,12 @@ def index():
 def parse():
     data = request.json or {}
     task_id = str(uuid.uuid4())
-    query = data.get('query', '')
-    many = int(data.get('many', 10))
+    
+    # Собираем запрос из организации и города (как в рабочей версии HF)
+    org = data.get('org', '')
+    city = data.get('city', '')
+    query = f"{org} {city}".strip()
+    many = int(data.get('many', 20))
     
     tasks[task_id] = {
         'status': 'running',
@@ -329,7 +330,7 @@ def parse():
         'results': [],
         'start_time': datetime.now(),
         'query': query,
-        'many': many
+        'requested': many
     }
     
     parser = GoogleMapsParser(
@@ -338,7 +339,7 @@ def parse():
         many,
         lang=data.get('lang', 'ru'),
         region=data.get('region', 'RU'),
-        deep_search=data.get('deep_search', True)
+        deep_search=data.get('deepSearch', True)
     )
     threading.Thread(target=parser.run).start()
     return jsonify({'task_id': task_id})
@@ -347,53 +348,56 @@ def parse():
 def status(task_id):
     if task_id not in tasks:
         return jsonify({'error': 'Task not found'}), 404
-    return jsonify(tasks[task_id])
+    return jsonify({
+        'status': tasks[task_id]['status'],
+        'progress': len(tasks[task_id]['results']),
+        'total': tasks[task_id]['requested'],
+        'logs': tasks[task_id]['logs']
+    })
+
+@app.route('/history_view')
+def history_view():
+    return render_template('history.html')
 
 @app.route('/history')
 def history():
     conn = get_db_connection()
-    if not conn:
-        return render_template('history.html', results=[])
+    if not conn: return "Database not connected", 500
     try:
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute('SELECT * FROM results ORDER BY timestamp DESC LIMIT 1000')
-        results = cursor.fetchall()
-        cursor.close()
+        df = pd.read_sql_query("SELECT * FROM results ORDER BY timestamp DESC", conn)
         conn.close()
-        return render_template('history.html', results=results)
-    except Exception as e:
-        print(f"⚠️ Ошибка получения истории: {e}")
-        return render_template('history.html', results=[])
-
-@app.route('/export/<task_id>')
-def export(task_id):
-    conn = get_db_connection()
-    if not conn:
-        return "Database not connected", 500
-    try:
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute('SELECT name, address, phone, rating, website, url FROM results WHERE task_id = %s', (task_id,))
-        results = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        
-        if not results:
-            return "No results found", 404
-            
-        df = pd.DataFrame(results)
+        if df.empty: return "История пуста", 404
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, index=False)
         output.seek(0)
-        
-        return send_file(
-            output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=f'results_{task_id}.xlsx'
-        )
+        return send_file(output, as_attachment=True, download_name="all_parsed_history.xlsx")
     except Exception as e:
-        return f"Export error: {e}", 500
+        return f"Error: {e}", 500
+
+@app.route('/download/<task_id>')
+def download(task_id):
+    if task_id not in tasks: return "Not found", 404
+    df = pd.DataFrame(tasks[task_id]['results'])
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False)
+    output.seek(0)
+    return send_file(output, as_attachment=True, download_name=f"results_{task_id}.xlsx")
+
+@app.route('/history_count')
+def history_count():
+    conn = get_db_connection()
+    if not conn: return jsonify({'count': 0})
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM results")
+        count = cursor.fetchone()[0]
+        cursor.close()
+        conn.close()
+        return jsonify({'count': count})
+    except:
+        return jsonify({'count': 0})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
