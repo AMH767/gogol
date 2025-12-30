@@ -11,6 +11,16 @@ RUN apt-get update && apt-get install -y \
     chromium-driver \
     libnss3 \
     libfontconfig1 \
+    libgconf-2-4 \
+    libxi6 \
+    libxcursor1 \
+    libxss1 \
+    libxcomposite1 \
+    libasound2 \
+    libxdamage1 \
+    libxtst6 \
+    libatk1.0-0 \
+    libgtk-3-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set environment variables for Chrome
@@ -31,10 +41,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Create necessary directories and set permissions
 RUN mkdir -p static/screenshots templates && chmod -R 777 /app
 
-# Render.com will use the PORT environment variable if provided, 
-# but we can default to 10000 or keep 7860. 
-# Let's use 10000 as it's standard for Render.
+# Render.com standard port
 EXPOSE 10000
 
 # Run the application with Gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:10000", "--workers", "1", "--timeout", "300", "app_google:app"]
+# Using 1 worker to save memory on Render
+CMD ["gunicorn", "--bind", "0.0.0.0:10000", "--workers", "1", "--threads", "4", "--timeout", "600", "app_google:app"]

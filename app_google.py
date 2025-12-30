@@ -32,12 +32,10 @@ def get_db_connection():
         return None
     
     url = DATABASE_URL
-    # Очистка строки подключения от pgbouncer, если он есть
     if 'pgbouncer=true' in url:
         url = url.replace('pgbouncer=true', '')
         url = url.replace('?&', '?').replace('&&', '&').strip('?&')
     
-    # Принудительный SSL для Supabase
     if 'sslmode' not in url:
         if '?' in url:
             url += '&sslmode=require'
@@ -77,7 +75,6 @@ def init_db():
     except Exception as e:
         print(f"❌ Ошибка при инициализации БД: {e}")
 
-# Инициализируем БД при запуске
 with app.app_context():
     init_db()
 
@@ -116,7 +113,8 @@ class GoogleMapsParser:
         self.lang = lang
         self.region = region
         self.deep_search = deep_search
-        self.max_workers = 5
+        # Оптимизация для Render: уменьшаем количество воркеров до 2, чтобы не перегружать RAM
+        self.max_workers = 2 
         self.results_lock = threading.Lock()
 
     def create_driver(self):
@@ -129,6 +127,13 @@ class GoogleMapsParser:
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_argument("--disable-images")
         
+        # Дополнительные флаги для экономии памяти на Render
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-dev-tools")
+        chrome_options.add_argument("--no-zygote")
+        chrome_options.add_argument("--single-process") # Может помочь в контейнерах с малым RAM
+        chrome_options.add_argument("--remote-debugging-pipe")
+        
         if os.path.exists("/usr/bin/chromium"):
             chrome_options.binary_location = "/usr/bin/chromium"
         elif os.path.exists("/usr/bin/chromium-browser"):
@@ -139,7 +144,10 @@ class GoogleMapsParser:
         
         try:
             driver = webdriver.Chrome(options=chrome_options)
-            driver.set_page_load_timeout(30)
+            # Увеличиваем таймауты для медленных сетей
+            driver.set_page_load_timeout(60)
+            driver.set_script_timeout(60)
+            
             stealth(driver,
                 languages=[f"{self.lang}-{self.region}", self.lang, "en-US", "en"],
                 vendor="Google Inc.",
@@ -164,12 +172,17 @@ class GoogleMapsParser:
             driver.get(url)
             
             try:
-                WebDriverWait(driver, 10).until(
+                # Увеличиваем ожидание до 20 секунд
+                WebDriverWait(driver, 20).until(
                     EC.presence_of_element_located((By.XPATH, '//a[contains(@href, "/maps/place/")]'))
                 )
             except:
-                driver.quit()
-                return []
+                # Если не нашли ссылки сразу, пробуем подождать еще немного
+                sleep(5)
+                found = driver.find_elements(By.XPATH, '//a[contains(@href, "/maps/place/")]')
+                if not found:
+                    driver.quit()
+                    return []
 
             scrollable_div = None
             selectors = ['//div[@role="feed"]', '//div[contains(@aria-label, "Results for")]']
@@ -189,7 +202,7 @@ class GoogleMapsParser:
             while len(links) < limit and no_change < 5:
                 if scrollable_div:
                     driver.execute_script('arguments[0].scrollTop = arguments[0].scrollHeight', scrollable_div)
-                sleep(2)
+                sleep(3) # Увеличиваем паузу между скроллами
                 found = driver.find_elements(By.XPATH, '//a[contains(@href, "/maps/place/")]')
                 for f in found:
                     href = f.get_attribute('href')
@@ -210,7 +223,7 @@ class GoogleMapsParser:
         
         try:
             driver.get(url)
-            sleep(2)
+            sleep(3) # Даем больше времени на прогрузку деталей
             soup = BeautifulSoup(driver.page_source, 'lxml')
             data = {'name': 'N/A', 'address': 'N/A', 'phone': 'N/A', 'rating': 'N/A', 'website': 'N/A', 'url': url}
             
@@ -288,15 +301,19 @@ class GoogleMapsParser:
 
             log_message(self.task_id, f"🚀 Начинаем детальный парсинг {len(links_to_parse)} организаций...")
             
+            # Используем ThreadPoolExecutor с ограничением max_workers
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = [executor.submit(self.parse_details, url) for url in links_to_parse]
                 for future in concurrent.futures.as_completed(futures):
-                    res = future.result()
-                    if res:
-                        with self.results_lock:
-                            tasks[self.task_id]['results'].append({"id": len(tasks[self.task_id]['results']) + 1, **res})
-                            save_to_db(self.task_id, res)
-                            log_message(self.task_id, f"✅ Спарсено:\n{res['name']}\n📍 {res['address']}\n📞 {res['phone']}\n🌐 {res['website']}\n---")
+                    try:
+                        res = future.result()
+                        if res:
+                            with self.results_lock:
+                                tasks[self.task_id]['results'].append({"id": len(tasks[self.task_id]['results']) + 1, **res})
+                                save_to_db(self.task_id, res)
+                                log_message(self.task_id, f"✅ Спарсено:\n{res['name']}\n📍 {res['address']}\n📞 {res['phone']}\n🌐 {res['website']}\n---")
+                    except Exception as e:
+                        log_message(self.task_id, f"⚠️ Ошибка парсинга организации: {e}")
 
             tasks[self.task_id]['end_time'] = datetime.now()
             duration = tasks[self.task_id]['end_time'] - tasks[self.task_id]['start_time']
@@ -318,7 +335,6 @@ def parse():
     data = request.json or {}
     task_id = str(uuid.uuid4())
     
-    # Собираем запрос из организации и города (как в рабочей версии HF)
     org = data.get('org', '')
     city = data.get('city', '')
     query = f"{org} {city}".strip()
