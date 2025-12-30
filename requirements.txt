@@ -1,0 +1,12 @@
+flask
+selenium
+selenium-stealth
+beautifulsoup4
+gunicorn
+webdriver-manager
+python-dotenv
+pandas
+openpyxl
+lxml
+requests
+psycopg2-binary
