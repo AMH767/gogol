@@ -30,21 +30,31 @@ DATABASE_URL = os.environ.get('DATABASE_URL')
 def get_db_connection():
     if not DATABASE_URL:
         return None
-    # Supabase и Render иногда конфликтуют по IPv6. 
-    # Добавляем sslmode=require для безопасности и стабильности
+    
     url = DATABASE_URL
+    # Удаляем pgbouncer=true, если он есть, так как psycopg2 может его не понимать
+    if 'pgbouncer=true' in url:
+        url = url.replace('pgbouncer=true', '')
+        url = url.replace('?&', '?').replace('&&', '&').strip('?&')
+    
+    # Добавляем sslmode=require для безопасности и стабильности, если его нет
     if 'sslmode' not in url:
         if '?' in url:
             url += '&sslmode=require'
         else:
             url += '?sslmode=require'
-    return psycopg2.connect(url)
+    
+    try:
+        return psycopg2.connect(url)
+    except Exception as e:
+        print(f"❌ Ошибка подключения к БД: {e}")
+        return None
 
 def init_db():
     try:
         conn = get_db_connection()
         if not conn:
-            print("⚠️ DATABASE_URL не задан. База данных не инициализирована.")
+            print("⚠️ DATABASE_URL не задан или ошибка подключения. База данных не инициализирована.")
             return
         cursor = conn.cursor()
         cursor.execute('''
@@ -67,25 +77,30 @@ def init_db():
     except Exception as e:
         print(f"❌ Ошибка при инициализации БД: {e}")
 
-# Инициализируем БД при запуске, но не даем приложению упасть, если нет сети
+# Инициализируем БД при запуске
 with app.app_context():
     init_db()
 
 def save_to_db(task_id, data):
-    conn = get_db_connection()
-    if not conn: return
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO results (task_id, name, address, phone, rating, website, url)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-    ''', (task_id, data['name'], data['address'], data['phone'], data['rating'], data['website'], data['url']))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        if not conn: return
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO results (task_id, name, address, phone, rating, website, url)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ''', (task_id, data.get('name', 'N/A'), data.get('address', 'N/A'), 
+              data.get('phone', 'N/A'), data.get('rating', 'N/A'), 
+              data.get('website', 'N/A'), data.get('url', 'N/A')))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️ Ошибка сохранения в БД: {e}")
 
 def log_message(task_id, msg):
     timestamp = datetime.now().strftime("%H:%M:%S")
-    clean_msg = msg.strip()
+    clean_msg = str(msg).strip()
     full_msg = f"[{timestamp}] {clean_msg}"
     print(full_msg)
     if task_id in tasks:
@@ -96,10 +111,10 @@ def log_message(task_id, msg):
 class GoogleMapsParser:
     def __init__(self, task_id, query, many, lang='ru', region='RU', deep_search=True):
         self.task_id = task_id
-        self.query = query
-        self.many = many
-        self.lang = lang
-        self.region = region
+        self.query = query if query else ""
+        self.many = int(many) if many else 10
+        self.lang = lang if lang else 'ru'
+        self.region = region if region else 'RU'
         self.deep_search = deep_search
         self.max_workers = 5
         self.results_lock = threading.Lock()
@@ -139,12 +154,15 @@ class GoogleMapsParser:
             return None
 
     def get_links_for_query(self, search_query, limit):
+        if not search_query:
+            return []
+            
         driver = self.create_driver()
         if not driver: return []
         
         links = set()
         try:
-            url = f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}?hl={self.lang}&gl={self.region}"
+            url = f"https://www.google.com/maps/search/{str(search_query).replace(' ', '+')}?hl={self.lang}&gl={self.region}"
             driver.get(url)
             
             try:
@@ -163,12 +181,17 @@ class GoogleMapsParser:
                     if scrollable_div: break
                 except: continue
             
-            if not scrollable_div: scrollable_div = driver.find_element(By.TAG_NAME, "body")
+            if not scrollable_div: 
+                try:
+                    scrollable_div = driver.find_element(By.TAG_NAME, "body")
+                except:
+                    pass
 
             last_len = 0
             no_change = 0
             while len(links) < limit and no_change < 5:
-                driver.execute_script('arguments[0].scrollTop = arguments[0].scrollHeight', scrollable_div)
+                if scrollable_div:
+                    driver.execute_script('arguments[0].scrollTop = arguments[0].scrollHeight', scrollable_div)
                 sleep(2)
                 found = driver.find_elements(By.XPATH, '//a[contains(@href, "/maps/place/")]')
                 for f in found:
@@ -236,6 +259,12 @@ class GoogleMapsParser:
         try:
             all_links = set()
             log_message(self.task_id, f"📡 Запуск основного поиска: {self.query}")
+            
+            if not self.query:
+                log_message(self.task_id, "❌ Ошибка: Пустой запрос")
+                tasks[self.task_id]['status'] = 'error'
+                return
+
             main_links = self.get_links_for_query(self.query, self.many)
             all_links.update(main_links)
             log_message(self.task_id, f"🔗 Найдено в основном поиске: {len(main_links)}")
@@ -275,8 +304,7 @@ class GoogleMapsParser:
             tasks[self.task_id]['end_time'] = datetime.now()
             duration = tasks[self.task_id]['end_time'] - tasks[self.task_id]['start_time']
             minutes, seconds = divmod(duration.total_seconds(), 60)
-            time_str = f"{int(minutes)}м {int(seconds)}с" if minutes > 0 else f"{int(seconds)}с"
-            
+            time_str = f"{int(minutes)}м {int(seconds)}с"
             log_message(self.task_id, f"✅ Сбор данных успешно завершен! Время выполнения: {time_str}")
             tasks[self.task_id]['status'] = 'completed'
         except Exception as e:
@@ -290,21 +318,24 @@ def index():
 
 @app.route('/parse', methods=['POST'])
 def parse():
-    data = request.json
+    data = request.json or {}
     task_id = str(uuid.uuid4())
+    query = data.get('query', '')
+    many = int(data.get('many', 10))
+    
     tasks[task_id] = {
         'status': 'running',
         'logs': [],
         'results': [],
         'start_time': datetime.now(),
-        'query': data.get('query', ''),
-        'many': int(data.get('many', 10))
+        'query': query,
+        'many': many
     }
     
     parser = GoogleMapsParser(
         task_id, 
-        data.get('query'), 
-        int(data.get('many', 10)),
+        query, 
+        many,
         lang=data.get('lang', 'ru'),
         region=data.get('region', 'RU'),
         deep_search=data.get('deep_search', True)
@@ -323,40 +354,46 @@ def history():
     conn = get_db_connection()
     if not conn:
         return render_template('history.html', results=[])
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    cursor.execute('SELECT * FROM results ORDER BY timestamp DESC LIMIT 1000')
-    results = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return render_template('history.html', results=results)
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('SELECT * FROM results ORDER BY timestamp DESC LIMIT 1000')
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return render_template('history.html', results=results)
+    except Exception as e:
+        print(f"⚠️ Ошибка получения истории: {e}")
+        return render_template('history.html', results=[])
 
 @app.route('/export/<task_id>')
 def export(task_id):
-    # Fetch results for this task from DB
     conn = get_db_connection()
     if not conn:
         return "Database not connected", 500
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    cursor.execute('SELECT name, address, phone, rating, website, url FROM results WHERE task_id = %s', (task_id,))
-    results = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    
-    if not results:
-        return "No results found", 404
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('SELECT name, address, phone, rating, website, url FROM results WHERE task_id = %s', (task_id,))
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
         
-    df = pd.DataFrame(results)
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False)
-    output.seek(0)
-    
-    return send_file(
-        output,
-        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        as_attachment=True,
-        download_name=f'results_{task_id}.xlsx'
-    )
+        if not results:
+            return "No results found", 404
+            
+        df = pd.DataFrame(results)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False)
+        output.seek(0)
+        
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f'results_{task_id}.xlsx'
+        )
+    except Exception as e:
+        return f"Export error: {e}", 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)

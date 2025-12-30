@@ -29,6 +29,8 @@ def get_subregions(query):
     Attempts to identify a city in the query and returns its subregions.
     Example: "Pizza New York" -> returns neighborhoods of New York.
     """
+    if not query:
+        return []
     query_lower = query.lower()
     for city, subregions in CITY_SUBREGIONS.items():
         if city.lower() in query_lower:
